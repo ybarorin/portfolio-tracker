@@ -152,6 +152,7 @@ export default function PositionCard({ pos, isExpanded, intraday, onToggle, onUp
       {isExpanded && (
         <div className="pos-body">
           <div className="fields">
+            <Field label="סמל מניה"    fieldKey="symbol"    value={pos.symbol}    type="text"   onChange={(key, val) => handleFieldChange(key, val ? val.toUpperCase() : val)} />
             <Field label="תאריך קנייה" fieldKey="buyDate"   value={pos.buyDate}   type="date"   onChange={handleFieldChange} />
             <Field label="מחיר קנייה"  fieldKey="buyPrice"  value={pos.buyPrice}  type="number" prefix="$" onChange={handleFieldChange} />
             <Field label="כמות"         fieldKey="qty"       value={pos.qty}       type="number" onChange={handleFieldChange} />
