@@ -3,11 +3,14 @@ import express from 'express';
 import cors from 'cors';
 import fetch from 'node-fetch';
 import { readPositions, writePositions, defaultPositions } from './db.js';
+import { readFile, writeFile } from 'fs/promises';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { existsSync } from 'fs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const NOTIFICATIONS_FILE = join(__dirname, 'data/notifications.json');
+const UNDO_FILE = join(__dirname, 'data/undo-history.json');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -15,6 +18,34 @@ const FINNHUB_KEY = process.env.FINNHUB_API_KEY;
 
 app.use(cors({ origin: ['http://localhost:5173', 'http://localhost:3000', 'http://localhost:4173'] }));
 app.use(express.json());
+
+// ── Helper functions ──────────────────────────────────────────────────────────
+
+async function readNotifications() {
+  try {
+    const data = await readFile(NOTIFICATIONS_FILE, 'utf-8');
+    return JSON.parse(data);
+  } catch (e) {
+    return [];
+  }
+}
+
+async function writeNotifications(notifications) {
+  await writeFile(NOTIFICATIONS_FILE, JSON.stringify(notifications, null, 2), 'utf-8');
+}
+
+async function readUndoHistory() {
+  try {
+    const data = await readFile(UNDO_FILE, 'utf-8');
+    return JSON.parse(data);
+  } catch (e) {
+    return { stack: [], index: -1 };
+  }
+}
+
+async function writeUndoHistory(history) {
+  await writeFile(UNDO_FILE, JSON.stringify(history, null, 2), 'utf-8');
+}
 
 // Serve React build in production
 const clientDist = join(__dirname, '../client/dist');
@@ -130,6 +161,64 @@ app.post('/api/refresh-prices', async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// ── Notifications ────────────────────────────────────────────────────────────
+
+app.get('/api/notifications', async (req, res) => {
+  try { res.json(await readNotifications()); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/notifications', async (req, res) => {
+  try {
+    const notifications = await readNotifications();
+    const newNotif = {
+      id: Date.now(),
+      positionId: req.body.positionId,
+      symbol: req.body.symbol,
+      type: req.body.type, // 'tp-hit' or 'sl-hit'
+      price: req.body.price,
+      level: req.body.level, // TP or SL value
+      timestamp: new Date().toISOString(),
+    };
+    notifications.push(newNotif);
+    await writeNotifications(notifications);
+    res.json(newNotif);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Undo/Redo ─────────────────────────────────────────────────────────────────
+
+app.get('/api/undo-history', async (req, res) => {
+  try { res.json(await readUndoHistory()); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/undo-save', async (req, res) => {
+  try {
+    const history = await readUndoHistory();
+    // Save current state to undo stack
+    history.stack = history.stack.slice(0, history.index + 1);
+    history.stack.push(JSON.stringify(req.body.state));
+    history.index = history.stack.length - 1;
+    await writeUndoHistory(history);
+    res.json({ ok: true, canUndo: history.index > 0 });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/undo', async (req, res) => {
+  try {
+    const history = await readUndoHistory();
+    if (history.index > 0) {
+      history.index--;
+      await writeUndoHistory(history);
+      const prevState = JSON.parse(history.stack[history.index]);
+      res.json({ ok: true, state: prevState, canUndo: history.index > 0 });
+    } else {
+      res.status(400).json({ error: 'No undo history' });
+    }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── Market status ─────────────────────────────────────────────────────────────
