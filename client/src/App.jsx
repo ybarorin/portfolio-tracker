@@ -8,6 +8,7 @@ import BarsChart    from './components/BarsChart.jsx';
 import {
   fetchPositions, addPosition, updatePosition,
   deletePosition, refreshPrices, resetPositions,
+  addNotification, saveUndoState, undoLastChange,
 } from './api.js';
 import { enrich, generateIntraday, isNYSEOpenIsrael } from './utils.js';
 
@@ -23,17 +24,28 @@ export default function App() {
   const [error,       setError]       = useState(null);
   const [marketOpen,  setMarketOpen]  = useState(false);
   const [lastRefresh, setLastRefresh] = useState(null);
+  const [isDirty,     setIsDirty]     = useState(false);
+  const [canUndo,     setCanUndo]     = useState(false);
 
   // Intraday cache lives in a ref so updates don't cause re-renders
   const intradayCacheRef = useRef({});
   const autoTimerRef     = useRef(null);
+  const undoStackRef     = useRef([]);
+  const notifiedRef      = useRef({}); // Track which TP/SL we've already notified about
 
   // ── Load on mount ──────────────────────────────────────────────────────────
 
   useEffect(() => {
+    // Request notification permission
+    if ('Notification' in window && Notification.permission === 'default') {
+      Notification.requestPermission();
+    }
+
+    // Load positions
     fetchPositions()
       .then(data => {
         setPositions(data);
+        undoStackRef.current = [JSON.stringify(data)];
         setExpandedId(data[0]?.id ?? null);
       })
       .catch(e => setError('לא ניתן לטעון פוזיציות: ' + e.message))
@@ -56,7 +68,12 @@ export default function App() {
     setError(null);
     try {
       const result = await refreshPrices();
+      const oldPositions = positions;
       setPositions(result.positions);
+
+      // Check for price crossings
+      checkPriceCrossings(oldPositions, result.positions);
+
       intradayCacheRef.current = {}; // invalidate intraday on price update
       setLastRefresh(new Date());
       flash(auto ? 'עודכן אוטומטית ✓' : 'מחירים עודכנו ✓');
@@ -68,7 +85,7 @@ export default function App() {
     } finally {
       setRefreshing(false);
     }
-  }, []);
+  }, [positions]);
 
   useEffect(() => {
     clearInterval(autoTimerRef.current);
@@ -93,14 +110,117 @@ export default function App() {
     return intradayCacheRef.current[pos.id];
   }
 
+  // Check if price crossed TP/SL levels
+  function checkPriceCrossings(oldPositions, newPositions) {
+    newPositions.forEach(newPos => {
+      const oldPos = oldPositions.find(p => p.id === newPos.id);
+      if (!oldPos) return;
+
+      const notifKey = `${newPos.id}`;
+      if (!notifiedRef.current[notifKey]) {
+        notifiedRef.current[notifKey] = {};
+      }
+
+      // Check TP
+      if (newPos.tp && oldPos.currentPrice !== newPos.currentPrice) {
+        const crossedTP = (oldPos.currentPrice <= newPos.tp && newPos.currentPrice >= newPos.tp) ||
+                          (oldPos.currentPrice >= newPos.tp && newPos.currentPrice <= newPos.tp);
+        if (crossedTP && !notifiedRef.current[notifKey].tp) {
+          notifiedRef.current[notifKey].tp = true;
+          triggerNotification(newPos, 'tp-hit');
+        }
+      }
+
+      // Check SL
+      if (newPos.sl && oldPos.currentPrice !== newPos.currentPrice) {
+        const crossedSL = (oldPos.currentPrice >= newPos.sl && newPos.currentPrice <= newPos.sl) ||
+                          (oldPos.currentPrice <= newPos.sl && newPos.currentPrice >= newPos.sl);
+        if (crossedSL && !notifiedRef.current[notifKey].sl) {
+          notifiedRef.current[notifKey].sl = true;
+          triggerNotification(newPos, 'sl-hit');
+        }
+      }
+    });
+  }
+
+  function triggerNotification(pos, type) {
+    const title = type === 'tp-hit' ? '🎯 יעד רווח הושג!' : '🛑 Stop Loss הופעל!';
+    const level = type === 'tp-hit' ? pos.tp : pos.sl;
+
+    // Browser notification if permission granted
+    if ('Notification' in window && Notification.permission === 'granted') {
+      const body = type === 'tp-hit'
+        ? `${pos.symbol} הגיע ל-TP: ${level}$ (מחיר נוכחי: ${pos.currentPrice}$)`
+        : `${pos.symbol} הגיע ל-SL: ${level}$ (מחיר נוכחי: ${pos.currentPrice}$)`;
+
+      new Notification(title, {
+        body,
+        icon: '/icon-192.png',
+        badge: '/icon-192.png',
+        tag: `${type}-${pos.id}`,
+        requireInteraction: true,
+      });
+
+      // Also send to service worker for background notifications
+      if ('serviceWorker' in navigator && navigator.serviceWorker.controller) {
+        navigator.serviceWorker.controller.postMessage({
+          type: 'SHOW_NOTIFICATION',
+          data: { title, symbol: pos.symbol, level, price: pos.currentPrice, notifType: type }
+        });
+      }
+    }
+
+    // UI alert
+    flash(`${title} ${pos.symbol} ב-${level}$`);
+
+    // Save to server
+    addNotification({
+      positionId: pos.id,
+      symbol: pos.symbol,
+      type,
+      price: pos.currentPrice,
+      level,
+    }).catch(e => console.warn('Failed to save notification:', e));
+  }
+
   // ── CRUD handlers ──────────────────────────────────────────────────────────
 
   async function handleUpdate(id, changes) {
     try {
-      const updated = await updatePosition(id, changes);
-      setPositions(prev => prev.map(p => p.id === id ? updated : p));
-      flash('נשמר ✓');
+      setPositions(prev => {
+        const updated = prev.map(p => p.id === id ? { ...p, ...changes } : p);
+
+        // Save to undo stack
+        undoStackRef.current.push(JSON.stringify(updated));
+        setCanUndo(true);
+
+        // Mark as dirty
+        setIsDirty(true);
+        setSaveMsg('שינויים לא שמורים ⚠');
+
+        return updated;
+      });
+
+      // Auto-save to server after a short delay
+      setTimeout(async () => {
+        try {
+          await updatePosition(id, changes);
+          setIsDirty(false);
+          flash('נשמר ✓');
+        } catch (e) { setError(e.message); }
+      }, 500);
     } catch (e) { setError(e.message); }
+  }
+
+  async function handleUndo() {
+    if (undoStackRef.current.length > 1) {
+      undoStackRef.current.pop(); // Remove current state
+      const prevState = JSON.parse(undoStackRef.current[undoStackRef.current.length - 1]);
+      setPositions(prevState);
+      setCanUndo(undoStackRef.current.length > 1);
+      setIsDirty(true);
+      flash('בוטל ↶');
+    }
   }
 
   async function handleAdd() {
@@ -110,7 +230,12 @@ export default function App() {
         symbol: 'NEW', buyDate: today, buyPrice: 1, qty: 1,
         sl: null, tp: null, broker: '', currentPrice: 1,
       });
-      setPositions(prev => [...prev, newPos]);
+      setPositions(prev => {
+        const updated = [...prev, newPos];
+        undoStackRef.current.push(JSON.stringify(updated));
+        setCanUndo(true);
+        return updated;
+      });
       setExpandedId(newPos.id);
     } catch (e) { setError(e.message); }
   }
@@ -118,7 +243,12 @@ export default function App() {
   async function handleRemove(id) {
     try {
       await deletePosition(id);
-      setPositions(prev => prev.filter(p => p.id !== id));
+      setPositions(prev => {
+        const updated = prev.filter(p => p.id !== id);
+        undoStackRef.current.push(JSON.stringify(updated));
+        setCanUndo(true);
+        return updated;
+      });
       delete intradayCacheRef.current[id];
       if (expandedId === id) setExpandedId(null);
     } catch (e) { setError(e.message); }
@@ -129,6 +259,8 @@ export default function App() {
     try {
       const data = await resetPositions();
       setPositions(data);
+      undoStackRef.current = [JSON.stringify(data)];
+      setCanUndo(false);
       intradayCacheRef.current = {};
       setExpandedId(data[0]?.id ?? null);
       flash('אופס לברירת מחדל ✓');
@@ -160,6 +292,15 @@ export default function App() {
           <button className="btn" onClick={() => doRefresh(false)} disabled={refreshing}>
             {refreshing ? '⏳ מרענן…' : '↻ רענן מחירים'}
           </button>
+          <button
+            className="btn"
+            onClick={handleUndo}
+            disabled={!canUndo}
+            title="בטל שינוי אחרון"
+            style={{ opacity: canUndo ? 1 : 0.5 }}
+          >
+            ↶ בטל
+          </button>
           <div style={{ fontSize: 12, color: marketOpen ? '#34D399' : '#5B6B7C' }}>
             {marketOpen
               ? '🟢 שוק פתוח — רענון אוטומטי כל 5 דקות'
@@ -169,7 +310,7 @@ export default function App() {
       </div>
 
       {/* ── Status bar ─────────────────────────────────────────────────────── */}
-      <div className={`save-status${saveSaved ? ' saved' : ''}`}>
+      <div className={`save-status${saveSaved ? ' saved' : ''}${isDirty ? ' dirty' : ''}`}>
         {saveMsg}
         {lastRefresh && ` | עדכון אחרון: ${lastRefresh.toLocaleTimeString('he-IL')}`}
       </div>
